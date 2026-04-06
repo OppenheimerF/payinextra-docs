@@ -1,0 +1,3465 @@
+openapi: 3.0.3
+info:
+  title: PayinExtra Merchant API
+  version: 1.0.0
+  description: |
+    PayinExtra exposes a REST API that lets registered merchants create customer deposits, request
+    withdrawals, cryptocurrency payouts, and monitor the lifecycle of those payments. Every request must
+    include the merchant's `X-API-Key` and `X-Merchant-Id` headers. These credentials are provisioned by
+    PayinExtra and are always available inside the PayinExtra merchant panel.
+
+    When a deposit is created, PayinExtra issues a `paymentId` that merchants can use to reconcile all
+    updates. The response also contains a `paymentPageUrl` that the merchant must redirect the
+    customer to. After confirmation, PayinExtra sends an HTTPS POST to the merchant's configured
+    webhook URL with the same payload that will later be posted to the merchant's configured return
+    URL. All webhook POST requests include the merchant-defined `X-Secret-Key` header so receivers can
+    authenticate the notification.
+
+    Merchants may pass optional customer or metadata attributes, but `merchantReference` is the only
+    required field used to map the user inside the merchant system. Customer identification details
+    can be omitted because PayinExtra will collect them on the hosted payment page when the payment
+    method requires it.
+
+    ## Idempotency
+
+    All POST requests to the PayinExtra API **require** an `X-Idempotency-Key` header to prevent duplicate
+    operations. This is critical for financial operations where retrying a failed request should not create
+    duplicate transactions.
+
+    ### What is Idempotency?
+
+    Idempotency ensures that making the same API request multiple times has the same effect as making it once.
+    If a network failure occurs after you send a request but before you receive a response, you can safely retry
+    the request with the same idempotency key without risk of creating duplicate resources.
+
+    ### How It Works
+
+    1. **Generate a unique key**: Create a unique identifier (UUID v4 recommended) on the client side before making a request
+    2. **Include in header**: Send the key in the `X-Idempotency-Key` header with your POST request
+    3. **Same key = Same result**: If you retry with the same key within 24 hours, you'll receive the original response
+    4. **New key = New resource**: Using a different key creates a new resource (deposit, withdrawal, payout)
+
+    ### Key Requirements
+
+    - **Required**: The `X-Idempotency-Key` header is mandatory for all POST endpoints
+    - **Format**: Any string up to 128 characters. UUID v4 format is recommended for uniqueness
+    - **Scope**: Keys are scoped to your merchant account and the specific operation type
+    - **Duration**: Keys are stored for 24 hours from the first request
+    - **Uniqueness**: Never reuse keys across different operations
+
+    ### Response Behavior
+
+    | Scenario | Response | Status Code |
+    |----------|----------|-------------|
+    | First request with key | Resource created, full response returned | 201 Created |
+    | Duplicate key (success/processing) | Original response returned from cache | 200 OK |
+    | Duplicate key (pending/failed) | Conflict error with existing resource ID | 409 Conflict |
+
+    ### Best Practices
+
+    #### Generate Keys Client-Side
+    ```javascript
+    // Good: Generate UUID on client
+    const idempotencyKey = crypto.randomUUID(); // UUID v4
+
+    // Good: Use timestamp + random for tracking
+    const idempotencyKey = `${Date.now()}-${Math.random().toString(36)}`;
+    ```
+
+    #### Store Keys with Request Context
+    ```javascript
+    // Store key with order/transaction for retry logic
+    const orderData = {
+      orderId: 'order-123',
+      idempotencyKey: idempotencyKey,
+      status: 'pending'
+    };
+
+    // On retry, use the same key
+    if (orderData.status === 'pending') {
+      await retryPayment(orderData.idempotencyKey);
+    }
+    ```
+
+    #### Never Reuse Keys
+    ```javascript
+    // Bad: Reusing key for different operations
+    const key = 'my-fixed-key';
+    await createDeposit(key, depositData);
+    await createWithdrawal(key, withdrawalData); // WRONG!
+
+    // Good: New key for each operation
+    await createDeposit(crypto.randomUUID(), depositData);
+    await createWithdrawal(crypto.randomUUID(), withdrawalData);
+    ```
+
+    ### Error Handling
+
+    #### Handling 409 Conflict
+    ```javascript
+    try {
+      const response = await createDeposit(idempotencyKey, data);
+      // Success - new resource created
+    } catch (error) {
+      if (error.status === 409) {
+        // Key already used - check error.details.paymentId
+        const existingPaymentId = error.details.paymentId;
+        // Either accept the existing resource or generate a new key
+      }
+    }
+    ```
+
+    #### Handling Expired Keys
+    After 24 hours, idempotency keys expire and are removed from cache. If you retry with an expired key:
+    - The API treats it as a new request
+    - A new resource will be created
+    - You should implement your own tracking to detect this scenario
+
+    ### Examples
+
+    #### Creating a Deposit with Idempotency
+    ```bash
+    curl -X POST https://payinextra.com/api/v1/payments/deposits \
+      -H "X-API-Key: your_api_key" \
+      -H "X-Merchant-Id: your_merchant_id" \
+      -H "X-Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "amount": 10000,
+        "currency": "TRY",
+        "merchantReference": "order-2024-001",
+        "paymentMethod": "bank_transfer"
+      }'
+    ```
+
+    #### Retrying with Same Key (Network Failure Recovery)
+    ```bash
+    # First request times out - no response received
+    # Retry with SAME key
+    curl -X POST https://payinextra.com/api/v1/payments/deposits \
+      -H "X-Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
+      ...
+
+    # Response: Returns original deposit (no duplicate created)
+    ```
+
+    #### Creating a Crypto Payout with Idempotency
+    ```bash
+    curl -X POST https://payinextra.com/api/v1/payments/crypto-payouts \
+      -H "X-API-Key: your_api_key" \
+      -H "X-Merchant-Id: your_merchant_id" \
+      -H "X-Idempotency-Key: 7c9e6679-7425-40de-944b-e07fc1f90ae7" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "amount": 1000000000,
+        "chain": "eth",
+        "tokenType": "usdt",
+        "merchantReference": "payout-2024-001"
+      }'
+    ```
+
+    ### Why Idempotency Matters
+
+    **Without idempotency**:
+    - Network timeout → Retry → Customer charged twice
+    - Server restart during processing → Duplicate withdrawal
+    - Client retries failed request → Multiple payouts
+
+    **With idempotency**:
+    - Network timeout → Retry with same key → Original response returned
+    - Server restart → Same key used → Duplicate detected
+    - Client retries → Same key → Safe, no duplicate created
+
+    ### Technical Implementation
+
+    PayinExtra implements idempotency using:
+    1. **Redis cache**: Fast lookup for recent requests (24-hour TTL)
+    2. **Database constraint**: Unique constraint on (merchant_id, idempotency_key) prevents race conditions
+    3. **Transaction safety**: Idempotency check happens within database transaction for atomicity
+
+    This dual-layer approach ensures both performance and correctness, even under high concurrency.
+servers:
+  - url: https://payinextra.com/api/v1
+    description: Production base URL. Enable sandbox mode from the merchant panel to work against a sandbox tenant on the same host.
+security:
+  - ApiKeyAuth: []
+    MerchantIdAuth: []
+tags:
+  - name: Deposits
+    description: Initiate customer deposit payments.
+  - name: Withdrawals
+    description: Initiate payout requests to customer destinations.
+  - name: Crypto Payouts
+    description: Request cryptocurrency payouts from merchant balances to blockchain addresses.
+  - name: Crypto Deposits
+    description: Initiate customer cryptocurrency deposit payments.
+  - name: Crypto Withdrawals
+    description: Initiate cryptocurrency payout requests to customer wallet addresses.
+  - name: Payments
+    description: Inspect the lifecycle and state of payments.
+  - name: Webhooks
+    description: Asynchronous notifications delivered to merchant systems.
+paths:
+  /payments/deposits:
+    post:
+      tags:
+        - Deposits
+      summary: Create a deposit payment
+      description: |
+        Create a new deposit payment and receive the hosted payment page URL. Redirect the
+        customer to `paymentPageUrl` to collect the payment. PayinExtra responds to your configured
+        webhook with the `payment.completed` payload when the customer finishes the checkout. That
+        payload is then posted to your configured return URL using the exact same body and headers.
+      security:
+        - ApiKeyAuth: []
+          MerchantIdAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DepositRequest'
+            examples:
+              bankTransfer:
+                summary: Create a checkout session for a bank transfer deposit
+                value:
+                  amount: 12550
+                  currency: TRY
+                  paymentMethod: bank_transfer
+                  merchantReference: order-2024-000045
+                  customer:
+                    name: Alex Rivers
+                    email: alex.rivers@example.com
+                    phone: '+905551234567'
+                    reference: user-1742
+                    identificationNumber: '12345678901'
+                  metadata:
+                    plan: premium
+                    cartId: cart-8GQ39
+              creditCard:
+                summary: Create a credit card payment with card details
+                value:
+                  amount: 25000
+                  currency: TRY
+                  paymentMethod: credit_card_tr
+                  merchantReference: order-2024-000046
+                  customer:
+                    name: Elif Yilmaz
+                    email: elif.yilmaz@example.com
+                    reference: user-2458
+                  cardDetails:
+                    cardNumber: '5555444433332222'
+                    cardholderName: 'ELIF YILMAZ'
+                    cardExpMonth: 12
+                    cardExpYear: 2025
+                    cvv: '123'
+                  metadata:
+                    orderType: subscription
+      responses:
+        '201':
+          description: Deposit payment created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentResource'
+              examples:
+                created:
+                  summary: Pending deposit awaiting customer confirmation
+                  value:
+                    paymentId: pay_01H9YE1N5CB3X7S9HESY7Y5XGK
+                    type: deposit
+                    status: pending
+                    paymentMethod: bank_transfer
+                    merchantReference: order-2024-000045
+                    amount: 12550
+                    currency: TRY
+                    paymentPageUrl: https://pay.payinextra.example.com/checkout/pay_01H9YE1N5CB3X7S9HESY7Y5XGK
+                    returnUrl: https://merchant.example.com/payments/return/deposit
+                    metadata:
+                      plan: premium
+                      cartId: cart-8GQ39
+                    customer:
+                      name: Alex Rivers
+                      email: alex.rivers@example.com
+                      reference: user-1742
+                    expiresAt: 2024-05-03T10:15:30Z
+                    createdAt: 2024-05-03T09:15:30Z
+                    updatedAt: 2024-05-03T09:15:30Z
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /payments/withdrawals:
+    post:
+      tags:
+        - Withdrawals
+      summary: Create a withdrawal request
+      description: |
+        Ask PayinExtra to transfer funds out to a customer destination using bank transfer (havale).
+        Withdrawals do not expose a hosted payment page. Status updates are delivered to the merchant
+        webhook and can be polled through the payments endpoint.
+      security:
+        - ApiKeyAuth: []
+          MerchantIdAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WithdrawalRequest'
+            examples:
+              withdrawal:
+                summary: Withdraw funds to a verified bank account
+                value:
+                  amount: 25000
+                  currency: TRY
+                  merchantReference: withdrawal-2024-0088
+                  destination:
+                    accountName: Alex Rivers
+                    iban: TR120006200119000006672315
+                    bankName: PayinExtra National Bank
+                  metadata:
+                    purpose: customer_refund
+                    invoice: inv-2040
+                  payoutMethod: havale
+      responses:
+        '201':
+          description: Withdrawal request accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentResource'
+              examples:
+                accepted:
+                  summary: Withdrawal queued for processing
+                  value:
+                    paymentId: pay_01H9YE1N5CB3X7S9HESY7Y5XWQ
+                    type: withdrawal
+                    status: processing
+                    merchantReference: withdrawal-2024-0088
+                    amount: 25000
+                    currency: TRY
+                    payoutMethod: havale
+                    metadata:
+                      purpose: customer_refund
+                      invoice: inv-2040
+                    expiresAt: null
+                    createdAt: 2024-05-03T09:35:11Z
+                    updatedAt: 2024-05-03T09:35:11Z
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /payments/crypto-payouts:
+    get:
+      tags:
+        - Crypto Payouts
+      summary: List cryptocurrency payouts
+      description: |
+        Retrieve a paginated list of cryptocurrency payouts with optional filtering.
+        Supports filtering by status, blockchain, token type, date range, and merchant reference.
+
+        **Important**: Crypto payouts are withdrawals to the merchant's own configured blockchain addresses.
+        All payouts require admin approval before processing.
+
+        **Use Cases:**
+        - View all pending payouts waiting for admin approval
+        - Check completed payouts for accounting
+        - Monitor processing payouts on blockchain
+        - Filter by specific blockchain or token
+
+        **Pagination:**
+        - Default: 20 items per page
+        - Maximum: 100 items per page
+        - Results include pagination metadata
+
+        **Filtering:**
+        - **status**: Comma-separated list (e.g., `pending,approved,processing,succeeded`)
+        - **chain**: Blockchain filter (e.g., `eth,tron`)
+        - **tokenType**: Token type filter (e.g., `usdt,usdc`)
+        - **from/to**: Date range in ISO 8601 format
+        - **merchantReference**: Partial match search
+        - **includeTotals**: Include sum totals in response (default: false)
+
+        **Sorting:**
+        - Default: `-createdAt` (newest first)
+        - Supported fields: `createdAt`, `updatedAt`, `amountMinor`, `status`
+        - Prefix with `-` for descending order
+      security:
+        - ApiKeyAuth: []
+          MerchantIdAuth: []
+      parameters:
+        - name: page
+          in: query
+          description: Page number (1-indexed)
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          description: Items per page
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: status
+          in: query
+          description: Filter by status (comma-separated)
+          required: false
+          schema:
+            type: string
+            example: 'pending,approved,processing,succeeded'
+        - name: chain
+          in: query
+          description: Filter by blockchain (comma-separated)
+          required: false
+          schema:
+            type: string
+            enum: [eth, bnb, polygon, tron]
+            example: 'eth,tron'
+        - name: tokenType
+          in: query
+          description: Filter by token type (comma-separated)
+          required: false
+          schema:
+            type: string
+            enum: [native, usdt, usdc]
+            example: 'usdt,usdc'
+        - name: from
+          in: query
+          description: Start date (ISO 8601)
+          required: false
+          schema:
+            type: string
+            format: date-time
+            example: '2025-01-01T00:00:00Z'
+        - name: to
+          in: query
+          description: End date (ISO 8601)
+          required: false
+          schema:
+            type: string
+            format: date-time
+            example: '2025-01-31T23:59:59Z'
+        - name: sort
+          in: query
+          description: Sort field and direction
+          required: false
+          schema:
+            type: string
+            default: '-createdAt'
+            example: '-createdAt'
+        - name: merchantReference
+          in: query
+          description: Filter by merchant reference (partial match)
+          required: false
+          schema:
+            type: string
+            example: 'settlement-01'
+        - name: includeTotals
+          in: query
+          description: Include sum totals in response
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: List of crypto payouts retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - data
+                  - pagination
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CryptoPayoutListItem'
+                  pagination:
+                    $ref: '#/components/schemas/PaginationMetadata'
+                  totals:
+                    $ref: '#/components/schemas/CryptoTransactionTotals'
+              examples:
+                withFilters:
+                  summary: Filtered payouts with totals
+                  value:
+                    data:
+                      - payoutId: pay_crypto_01HQWE123
+                        type: crypto_payout
+                        status: succeeded
+                        chain: eth
+                        tokenType: usdt
+                        amount: 500000
+                        toAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb7'
+                        merchantReference: settlement-01
+                        createdAt: '2025-01-20T10:00:00Z'
+                        approvedAt: '2025-01-20T11:00:00Z'
+                        processedAt: '2025-01-20T11:05:00Z'
+                        completedAt: '2025-01-20T11:10:00Z'
+                        txHash: '0xabc123...'
+                        confirmations: 12
+                        explorerUrl: 'https://etherscan.io/tx/0xabc123...'
+                        requiresApproval: false
+                      - payoutId: pay_crypto_01HQWE456
+                        type: crypto_payout
+                        status: pending
+                        chain: tron
+                        tokenType: usdt
+                        amount: 250000
+                        toAddress: 'TXYZa1b2c3d4e5f6g7h8i9j0k1l2m3n4o5'
+                        merchantReference: settlement-02
+                        createdAt: '2025-01-20T12:00:00Z'
+                        approvedAt: null
+                        processedAt: null
+                        completedAt: null
+                        txHash: null
+                        confirmations: 0
+                        explorerUrl: null
+                        requiresApproval: true
+                    pagination:
+                      page: 1
+                      limit: 20
+                      total: 2
+                      totalPages: 1
+                      hasNext: false
+                      hasPrev: false
+                    totals:
+                      totalAmount: 750000
+                      pendingAmount: 250000
+                      succeededAmount: 500000
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags:
+        - Crypto Payouts
+      summary: Create a cryptocurrency payout
+      description: |
+        Request a cryptocurrency payout from your merchant balance to your configured blockchain address.
+
+        **Important Notes:**
+        - All crypto payouts require admin approval before processing
+        - The requested amount is held from your available balance immediately upon creation
+        - You will receive webhook notifications for status changes: approved, processing, succeeded, or failed
+        - Platform absorbs all gas fees - you receive the full requested amount
+        - Payouts cannot be cancelled after approval
+
+        **Status Flow:**
+        1. `pending` - Created, awaiting admin approval (typically 1-24 hours)
+        2. `approved` - Approved by admin, queued for blockchain processing
+        3. `processing` - Transaction being broadcast to blockchain
+        4. `succeeded` - Transaction confirmed on blockchain with required confirmations
+        5. `failed` - Transaction failed or rejected by admin (balance released)
+
+        **Blockchain Support:**
+        - **Ethereum (eth)**: ETH, USDT-ERC20, USDC-ERC20
+        - **BNB Smart Chain (bnb)**: BNB, USDT-BEP20, USDC-BEP20
+        - **Polygon (polygon)**: MATIC, USDT-Polygon, USDC-Polygon
+        - **Tron (tron)**: TRX, USDT-TRC20, USDC-TRC20
+      security:
+        - ApiKeyAuth: []
+          MerchantIdAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CryptoPayoutRequest'
+            examples:
+              ethNative:
+                summary: Payout 0.5 ETH to configured Ethereum address
+                value:
+                  amount: 500000000000000000
+                  chain: eth
+                  tokenType: native
+                  merchantReference: payout-2024-001
+                  metadata:
+                    purpose: Monthly settlement
+                    invoiceId: INV-2024-001
+              bnbUsdt:
+                summary: Payout 1000 USDT on BNB Smart Chain
+                value:
+                  amount: 1000000000
+                  chain: bnb
+                  tokenType: usdt
+                  merchantReference: payout-2024-002
+              polygonUsdc:
+                summary: Payout 500 USDC on Polygon to custom address
+                value:
+                  amount: 500000000
+                  chain: polygon
+                  tokenType: usdc
+                  merchantReference: payout-2024-003
+                  toAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb'
+                  metadata:
+                    purpose: Vendor payment
+              tronUsdt:
+                summary: Payout 2000 USDT on Tron
+                value:
+                  amount: 2000000000
+                  chain: tron
+                  tokenType: usdt
+                  merchantReference: payout-2024-004
+      responses:
+        '201':
+          description: Crypto payout created successfully and pending admin approval
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CryptoPayoutResource'
+              example:
+                payoutId: payout_abc123def456
+                type: crypto_payout
+                status: pending
+                chain: eth
+                tokenType: usdt
+                amount: 1000000000
+                toAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb'
+                merchantReference: payout-2024-001
+                metadata:
+                  purpose: Monthly settlement
+                createdAt: '2024-03-15T10:30:00.000Z'
+                approvedAt: null
+                processedAt: null
+                completedAt: null
+                txHash: null
+                blockNumber: null
+                confirmations: 0
+                confirmationsRequired: 12
+                explorerUrl: null
+                failureCode: null
+                failureReason: null
+                estimatedProcessingTime: Waiting for admin approval (typically 1-24 hours)
+                requiresApproval: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Crypto payouts disabled for merchant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                success: false
+                error:
+                  code: CRYPTO_PAYOUTS_DISABLED
+                  message: Crypto payouts are not enabled for this merchant
+        '409':
+          description: Duplicate idempotency key or merchant reference
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                duplicateIdempotency:
+                  summary: Duplicate idempotency key
+                  value:
+                    success: false
+                    error:
+                      code: DUPLICATE_REQUEST
+                      message: Duplicate idempotency key
+                      details:
+                        payoutId: payout_abc123def456
+                        status: pending
+                duplicateReference:
+                  summary: Duplicate merchant reference
+                  value:
+                    success: false
+                    error:
+                      code: DUPLICATE_MERCHANT_REFERENCE
+                      message: Duplicate merchant reference
+                      details:
+                        payoutId: payout_xyz789ghi012
+                        merchantReference: payout-2024-001
+        '422':
+          description: Validation error (insufficient balance, address not configured, etc.)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                insufficientBalance:
+                  summary: Insufficient crypto balance
+                  value:
+                    success: false
+                    error:
+                      code: CRYPTO_PAYOUT_INSUFFICIENT_BALANCE
+                      message: Insufficient eth usdt balance
+                      details:
+                        requestedAmount: 1000000000
+                        chain: eth
+                        tokenType: usdt
+                addressNotConfigured:
+                  summary: Payout address not configured
+                  value:
+                    success: false
+                    error:
+                      code: CRYPTO_PAYOUT_ADDRESS_NOT_CONFIGURED
+                      message: No payout address configured for eth chain
+                      details:
+                        chain: eth
+                invalidAddress:
+                  summary: Invalid blockchain address
+                  value:
+                    success: false
+                    error:
+                      code: CRYPTO_PAYOUT_INVALID_ADDRESS
+                      message: Invalid Ethereum address format
+                      details:
+                        address: invalid_address
+                        chain: eth
+                amountTooLow:
+                  summary: Amount below minimum threshold
+                  value:
+                    success: false
+                    error:
+                      code: CRYPTO_PAYOUT_AMOUNT_TOO_LOW
+                      message: Amount is below minimum payout threshold
+                      details:
+                        requestedAmount: 100000
+                        minimumAmount: 10000000
+                        tokenType: usdt
+                        chain: eth
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /payments/crypto-deposits:
+    get:
+      tags:
+        - Crypto Deposits
+      summary: List cryptocurrency deposits
+      description: |
+        Retrieve a paginated list of cryptocurrency deposits with optional filtering.
+        Supports filtering by status, blockchain, token type, date range, and merchant reference.
+
+        **Use Cases:**
+        - View all pending deposits waiting for customer payment
+        - Check completed deposits for accounting purposes
+        - Filter by specific blockchain or token for reconciliation
+        - Search by merchant reference to find specific orders
+
+        **Pagination:**
+        - Default: 20 items per page
+        - Maximum: 100 items per page
+        - Results include pagination metadata (page, limit, total, totalPages, hasNext, hasPrev)
+
+        **Filtering:**
+        - **status**: Comma-separated list (e.g., `pending,confirmed,succeeded`)
+        - **chain**: Blockchain filter (e.g., `eth,tron`)
+        - **tokenType**: Token type filter (e.g., `usdt,usdc`)
+        - **from/to**: Date range in ISO 8601 format
+        - **merchantReference**: Partial match search
+        - **includeTotals**: Include sum totals in response (default: false)
+
+        **Sorting:**
+        - Default: `-createdAt` (newest first)
+        - Supported fields: `createdAt`, `updatedAt`, `amountMinor`, `status`
+        - Prefix with `-` for descending order
+      security:
+        - ApiKeyAuth: []
+          MerchantIdAuth: []
+      parameters:
+        - name: page
+          in: query
+          description: Page number (1-indexed)
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          description: Items per page
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: status
+          in: query
+          description: Filter by status (comma-separated)
+          required: false
+          schema:
+            type: string
+            example: 'pending,confirmed,succeeded'
+        - name: chain
+          in: query
+          description: Filter by blockchain (comma-separated)
+          required: false
+          schema:
+            type: string
+            enum: [eth, bnb, polygon, tron]
+            example: 'eth,tron'
+        - name: tokenType
+          in: query
+          description: Filter by token type (comma-separated)
+          required: false
+          schema:
+            type: string
+            enum: [native, usdt, usdc]
+            example: 'usdt,usdc'
+        - name: from
+          in: query
+          description: Start date (ISO 8601)
+          required: false
+          schema:
+            type: string
+            format: date-time
+            example: '2025-01-01T00:00:00Z'
+        - name: to
+          in: query
+          description: End date (ISO 8601)
+          required: false
+          schema:
+            type: string
+            format: date-time
+            example: '2025-01-31T23:59:59Z'
+        - name: sort
+          in: query
+          description: Sort field and direction
+          required: false
+          schema:
+            type: string
+            default: '-createdAt'
+            example: '-createdAt'
+        - name: merchantReference
+          in: query
+          description: Filter by merchant reference (partial match)
+          required: false
+          schema:
+            type: string
+            example: 'order-12345'
+        - name: includeTotals
+          in: query
+          description: Include sum totals in response
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: List of crypto deposits retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - data
+                  - pagination
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CryptoDepositListItem'
+                  pagination:
+                    $ref: '#/components/schemas/PaginationMetadata'
+                  totals:
+                    $ref: '#/components/schemas/CryptoTransactionTotals'
+              examples:
+                withFilters:
+                  summary: Filtered deposits with totals
+                  value:
+                    data:
+                      - depositId: dep_crypto_01HQWE123
+                        type: crypto_deposit
+                        status: succeeded
+                        chain: eth
+                        tokenType: usdt
+                        depositAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb7'
+                        expectedCryptoAmount: '1000000'
+                        expectedCryptoFormatted: '1.0 USDT'
+                        merchantReference: order-12345
+                        amount: 100000
+                        currency: TRY
+                        expiresAt: null
+                        createdAt: '2025-01-20T12:00:00Z'
+                        updatedAt: '2025-01-20T12:05:00Z'
+                        txHash: '0xabc123...'
+                        confirmations: 12
+                        explorerUrl: 'https://etherscan.io/tx/0xabc123...'
+                      - depositId: dep_crypto_01HQWE456
+                        type: crypto_deposit
+                        status: pending
+                        chain: tron
+                        tokenType: usdt
+                        depositAddress: 'TXYZa1b2c3d4e5f6g7h8i9j0k1l2m3n4o5'
+                        expectedCryptoAmount: '500000'
+                        expectedCryptoFormatted: '0.5 USDT'
+                        merchantReference: order-67890
+                        amount: 50000
+                        currency: TRY
+                        expiresAt: '2025-01-20T12:30:00Z'
+                        createdAt: '2025-01-20T12:15:00Z'
+                        updatedAt: '2025-01-20T12:15:00Z'
+                        txHash: null
+                        confirmations: 0
+                        explorerUrl: null
+                    pagination:
+                      page: 1
+                      limit: 20
+                      total: 2
+                      totalPages: 1
+                      hasNext: false
+                      hasPrev: false
+                    totals:
+                      totalAmount: 150000
+                      pendingAmount: 50000
+                      succeededAmount: 100000
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags:
+        - Crypto Deposits
+      summary: Create a cryptocurrency deposit
+      description: |
+        Create a new cryptocurrency deposit request. The system assigns a unique wallet address for the customer to send crypto to.
+        The blockchain scanner automatically monitors for incoming transactions and updates the deposit status.
+
+        **Important Notes:**
+        - Customer sends cryptocurrency to the assigned address
+        - System monitors blockchain for incoming transactions via scanner service
+        - Deposit credited to merchant balance after required confirmations
+        - Each deposit gets a unique address to prevent confusion
+        - Addresses may be reused after deposit completion (wallet pool management)
+
+        **Status Flow:**
+        1. `pending` - Address assigned, waiting for customer to send crypto
+        2. `confirmed` - Transaction detected on blockchain, awaiting confirmations
+        3. `succeeded` - Required confirmations received, balance credited to merchant
+        4. `failed` - Deposit failed (wrong amount, expired, or other error)
+        5. `expired` - Deposit expired (customer didn't send within time limit)
+
+        **Blockchain Support:**
+        - **Ethereum (eth)**: ETH, USDT-ERC20, USDC-ERC20
+        - **BNB Smart Chain (bnb)**: BNB, USDT-BEP20, USDC-BEP20
+        - **Polygon (polygon)**: MATIC, USDT-Polygon, USDC-Polygon
+        - **Tron (tron)**: TRX, USDT-TRC20, USDC-TRC20
+
+        **Amount Conversion:**
+        - You specify the fiat amount (TRY) you want to receive
+        - System calculates equivalent crypto amount using current market price
+        - Customer must send exact crypto amount shown
+        - Price locked for deposit duration (typically 30-60 minutes)
+      security:
+        - ApiKeyAuth: []
+          MerchantIdAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CryptoDepositRequest'
+            examples:
+              ethNative:
+                summary: Deposit 1000 TRY worth of ETH
+                value:
+                  amount: 100000
+                  currency: TRY
+                  chain: eth
+                  tokenType: native
+                  merchantReference: order-12345
+                  customer:
+                    name: Ahmet Yılmaz
+                    email: ahmet@example.com
+                    phone: '+905551234567'
+                    reference: customer-001
+                  metadata:
+                    orderId: '12345'
+                    productId: 'premium-package'
+              usdtTron:
+                summary: Deposit 500 TRY worth of USDT on Tron
+                value:
+                  amount: 50000
+                  currency: TRY
+                  chain: tron
+                  tokenType: usdt
+                  merchantReference: deposit-67890
+                  customer:
+                    name: Mehmet Kaya
+                    email: mehmet@example.com
+                  metadata:
+                    source: mobile-app
+              usdcPolygon:
+                summary: Deposit 250 TRY worth of USDC on Polygon
+                value:
+                  amount: 25000
+                  currency: TRY
+                  chain: polygon
+                  tokenType: usdc
+                  merchantReference: ref-abc123
+      responses:
+        '201':
+          description: Deposit created successfully. Customer should send crypto to the assigned address.
+          headers:
+            X-Idempotency-Key:
+              $ref: '#/components/headers/IdempotencyKeyResponse'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CryptoDepositResource'
+              examples:
+                ethDeposit:
+                  summary: ETH deposit created
+                  value:
+                    depositId: dep_crypto_01HQWE123
+                    type: crypto_deposit
+                    status: pending
+                    chain: eth
+                    tokenType: native
+                    depositAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb'
+                    expectedCryptoAmount: '500000000000000000'
+                    expectedCryptoFormatted: '0.5 ETH'
+                    qrCodeData: 'ethereum:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb?value=500000000000000000'
+                    expiresAt: '2025-01-20T12:30:00.000Z'
+                    paymentPageUrl: 'https://payinextra.com/pay/dep_crypto_01HQWE123'
+                    explorerUrl: 'https://etherscan.io/address/0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb'
+                    merchantReference: order-12345
+                    amount: 100000
+                    currency: TRY
+                    metadata:
+                      orderId: '12345'
+                      productId: 'premium-package'
+                    createdAt: '2025-01-20T12:00:00.000Z'
+                usdtDeposit:
+                  summary: USDT deposit created
+                  value:
+                    depositId: dep_crypto_01HQWE456
+                    type: crypto_deposit
+                    status: pending
+                    chain: tron
+                    tokenType: usdt
+                    depositAddress: 'TXYZa1b2c3d4e5f6g7h8i9j0k1l2m3n4o5'
+                    expectedCryptoAmount: '150000000'
+                    expectedCryptoFormatted: '150 USDT'
+                    qrCodeData: 'tron:TXYZa1b2c3d4e5f6g7h8i9j0k1l2m3n4o5?amount=150000000&token=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t'
+                    expiresAt: '2025-01-20T12:45:00.000Z'
+                    paymentPageUrl: 'https://payinextra.com/pay/dep_crypto_01HQWE456'
+                    explorerUrl: 'https://tronscan.org/#/address/TXYZa1b2c3d4e5f6g7h8i9j0k1l2m3n4o5'
+                    merchantReference: deposit-67890
+                    amount: 50000
+                    currency: TRY
+                    metadata:
+                      source: mobile-app
+                    createdAt: '2025-01-20T12:15:00.000Z'
+        '200':
+          description: Idempotent response - deposit already exists with this idempotency key (cached response)
+          headers:
+            X-Idempotency-Key:
+              $ref: '#/components/headers/IdempotencyKeyResponse'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CryptoDepositResource'
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                missingIdempotencyKey:
+                  summary: Missing idempotency key
+                  value:
+                    error:
+                      code: MISSING_IDEMPOTENCY_KEY
+                      message: X-Idempotency-Key header is required
+                tokenNotSupported:
+                  summary: Token not supported on chain
+                  value:
+                    error:
+                      code: CRYPTO_DEPOSIT_TOKEN_NOT_SUPPORTED
+                      message: Token btc is not supported on eth chain
+                      details:
+                        chain: eth
+                        tokenType: btc
+                        supportedTokens: 'native, usdt, usdc'
+                walletPoolExhausted:
+                  summary: No available wallet addresses
+                  value:
+                    error:
+                      code: CRYPTO_WALLET_POOL_EXHAUSTED
+                      message: No cryptocurrency addresses available at the moment. Please try again later.
+                priceUnavailable:
+                  summary: Price oracle unavailable
+                  value:
+                    error:
+                      code: CRYPTO_PRICE_UNAVAILABLE
+                      message: Unable to determine cryptocurrency price at this time. Please try again later.
+                amountTooLow:
+                  summary: Amount below minimum
+                  value:
+                    error:
+                      code: CRYPTO_DEPOSIT_AMOUNT_TOO_LOW
+                      message: Minimum deposit amount is 100 TRY
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /payments/crypto-withdrawals:
+    get:
+      tags:
+        - Crypto Withdrawals
+      summary: List cryptocurrency withdrawals
+      description: |
+        Retrieve a paginated list of cryptocurrency withdrawals with optional filtering.
+        Supports filtering by status, blockchain, token type, destination address, date range, and merchant reference.
+
+        **Use Cases:**
+        - View all pending withdrawals awaiting blockchain confirmation
+        - Check completed withdrawals for accounting and reconciliation
+        - Filter by specific blockchain or token
+        - Search by destination address or merchant reference
+
+        **Pagination:**
+        - Default: 20 items per page
+        - Maximum: 100 items per page
+        - Results include pagination metadata
+
+        **Filtering:**
+        - **status**: Comma-separated list (e.g., `pending,processing,succeeded`)
+        - **chain**: Blockchain filter (e.g., `eth,tron`)
+        - **tokenType**: Token type filter (e.g., `usdt,usdc`)
+        - **toAddress**: Filter by destination address (partial match)
+        - **from/to**: Date range in ISO 8601 format
+        - **merchantReference**: Partial match search
+        - **includeTotals**: Include sum totals in response (default: false)
+
+        **Sorting:**
+        - Default: `-createdAt` (newest first)
+        - Supported fields: `createdAt`, `updatedAt`, `amountMinor`, `status`
+        - Prefix with `-` for descending order
+      security:
+        - ApiKeyAuth: []
+          MerchantIdAuth: []
+      parameters:
+        - name: page
+          in: query
+          description: Page number (1-indexed)
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          description: Items per page
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: status
+          in: query
+          description: Filter by status (comma-separated)
+          required: false
+          schema:
+            type: string
+            example: 'pending,processing,succeeded'
+        - name: chain
+          in: query
+          description: Filter by blockchain (comma-separated)
+          required: false
+          schema:
+            type: string
+            enum: [eth, bnb, polygon, tron]
+            example: 'eth,tron'
+        - name: tokenType
+          in: query
+          description: Filter by token type (comma-separated)
+          required: false
+          schema:
+            type: string
+            enum: [native, usdt, usdc]
+            example: 'usdt,usdc'
+        - name: toAddress
+          in: query
+          description: Filter by destination address (partial match)
+          required: false
+          schema:
+            type: string
+            example: '0x742d35Cc'
+        - name: from
+          in: query
+          description: Start date (ISO 8601)
+          required: false
+          schema:
+            type: string
+            format: date-time
+            example: '2025-01-01T00:00:00Z'
+        - name: to
+          in: query
+          description: End date (ISO 8601)
+          required: false
+          schema:
+            type: string
+            format: date-time
+            example: '2025-01-31T23:59:59Z'
+        - name: sort
+          in: query
+          description: Sort field and direction
+          required: false
+          schema:
+            type: string
+            default: '-createdAt'
+            example: '-createdAt'
+        - name: merchantReference
+          in: query
+          description: Filter by merchant reference (partial match)
+          required: false
+          schema:
+            type: string
+            example: 'refund-12345'
+        - name: includeTotals
+          in: query
+          description: Include sum totals in response
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: List of crypto withdrawals retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - data
+                  - pagination
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CryptoWithdrawalListItem'
+                  pagination:
+                    $ref: '#/components/schemas/PaginationMetadata'
+                  totals:
+                    $ref: '#/components/schemas/CryptoTransactionTotals'
+              examples:
+                withFilters:
+                  summary: Filtered withdrawals with totals
+                  value:
+                    data:
+                      - withdrawalId: wth_crypto_01HQWE123
+                        type: crypto_withdrawal
+                        status: succeeded
+                        chain: tron
+                        tokenType: usdt
+                        toAddress: 'TXYZa1b2c3d4e5f6g7h8i9j0k1l2m3n4o5'
+                        recipientName: 'Customer Name'
+                        merchantReference: refund-12345
+                        amount: 50000
+                        netAmount: 48500
+                        commission: 1500
+                        currency: TRY
+                        description: 'Refund for order #12345'
+                        providerReference: '0xabc123...'
+                        createdAt: '2025-01-20T12:00:00Z'
+                        completedAt: '2025-01-20T12:05:00Z'
+                        txHash: '0xabc123...'
+                        explorerUrl: 'https://tronscan.org/#/transaction/0xabc123...'
+                      - withdrawalId: wth_crypto_01HQWE456
+                        type: crypto_withdrawal
+                        status: pending
+                        chain: eth
+                        tokenType: usdt
+                        toAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb7'
+                        recipientName: null
+                        merchantReference: payout-67890
+                        amount: 100000
+                        netAmount: 98000
+                        commission: 2000
+                        currency: TRY
+                        description: null
+                        providerReference: null
+                        createdAt: '2025-01-20T12:15:00Z'
+                        completedAt: null
+                        txHash: null
+                        explorerUrl: null
+                    pagination:
+                      page: 1
+                      limit: 20
+                      total: 2
+                      totalPages: 1
+                      hasNext: false
+                      hasPrev: false
+                    totals:
+                      totalAmount: 150000
+                      pendingAmount: 100000
+                      succeededAmount: 50000
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags:
+        - Crypto Withdrawals
+      summary: Create a cryptocurrency withdrawal
+      description: |
+        Create a new cryptocurrency withdrawal request to send crypto from your merchant balance to a customer's wallet address.
+        This is typically used for refunds or payouts to customers in cryptocurrency.
+
+        **Important Notes:**
+        - Sends crypto from merchant balance to customer's wallet address
+        - Different from crypto-payouts (which send to merchant's own configured address with admin approval)
+        - Withdrawal processed immediately after balance validation (no admin approval required)
+        - You specify fiat amount (TRY), system calculates equivalent crypto amount
+        - Platform may charge commission based on your merchant settings
+
+        **Status Flow:**
+        1. `pending` - Created, queued for blockchain processing
+        2. `processing` - Transaction being broadcast to blockchain
+        3. `succeeded` - Transaction confirmed on blockchain with required confirmations
+        4. `failed` - Transaction failed (insufficient gas, invalid address, network error)
+
+        **Blockchain Support:**
+        - **Ethereum (eth)**: ETH, USDT-ERC20, USDC-ERC20
+        - **BNB Smart Chain (bnb)**: BNB, USDT-BEP20, USDC-BEP20
+        - **Polygon (polygon)**: MATIC, USDT-Polygon, USDC-Polygon
+        - **Tron (tron)**: TRX, USDT-TRC20, USDC-TRC20
+
+        **Amount Conversion:**
+        - You specify the fiat amount (TRY) to send
+        - System calculates equivalent crypto amount using current market price
+        - Customer receives exact crypto amount calculated
+        - Price determined at withdrawal creation time
+
+        **Gas Fees:**
+        - Platform covers gas fees for blockchain transactions
+        - Commission (if configured) is deducted from withdrawal amount
+        - Net amount sent to customer = amount - commission
+      security:
+        - ApiKeyAuth: []
+          MerchantIdAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CryptoWithdrawalRequest'
+            examples:
+              ethRefund:
+                summary: Refund 500 TRY worth of ETH to customer
+                value:
+                  amount: 50000
+                  currency: TRY
+                  chain: eth
+                  tokenType: native
+                  destination:
+                    address: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb'
+                    name: Ahmet Yılmaz
+                  merchantReference: refund-order-12345
+                  description: Refund for cancelled order #12345
+                  customer:
+                    name: Ahmet Yılmaz
+                    email: ahmet@example.com
+                    reference: customer-001
+                  metadata:
+                    orderId: '12345'
+                    reason: customer-request
+              usdtPayout:
+                summary: Payout 1000 TRY worth of USDT on Tron to customer
+                value:
+                  amount: 100000
+                  currency: TRY
+                  chain: tron
+                  tokenType: usdt
+                  destination:
+                    address: 'TXYZa1b2c3d4e5f6g7h8i9j0k1l2m3n4o5'
+                    name: Mehmet Kaya
+                  merchantReference: payout-affiliate-67890
+                  description: Affiliate commission payout
+                  customer:
+                    email: mehmet@example.com
+                  metadata:
+                    affiliateId: 'aff-789'
+              usdcPolygon:
+                summary: Refund 250 TRY worth of USDC on Polygon
+                value:
+                  amount: 25000
+                  currency: TRY
+                  chain: polygon
+                  tokenType: usdc
+                  destination:
+                    address: '0x1234567890abcdef1234567890abcdef12345678'
+                  merchantReference: ref-return-abc123
+                  description: Product return refund
+      responses:
+        '201':
+          description: Withdrawal created successfully and queued for processing
+          headers:
+            X-Idempotency-Key:
+              $ref: '#/components/headers/IdempotencyKeyResponse'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CryptoWithdrawalResource'
+              examples:
+                ethWithdrawal:
+                  summary: ETH withdrawal created
+                  value:
+                    withdrawalId: wth_crypto_01HQWE123
+                    type: crypto_withdrawal
+                    status: pending
+                    chain: eth
+                    tokenType: native
+                    toAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb'
+                    recipientName: Ahmet Yılmaz
+                    merchantReference: refund-order-12345
+                    amount: 50000
+                    netAmount: 48500
+                    commission: 1500
+                    currency: TRY
+                    description: Refund for cancelled order #12345
+                    metadata:
+                      orderId: '12345'
+                      reason: customer-request
+                    providerReference: null
+                    estimatedProcessingTime: 'Queued for blockchain processing (typically 5-30 minutes)'
+                    createdAt: '2025-01-20T12:00:00.000Z'
+                    processedAt: null
+                    completedAt: null
+                usdtWithdrawal:
+                  summary: USDT withdrawal created
+                  value:
+                    withdrawalId: wth_crypto_01HQWE456
+                    type: crypto_withdrawal
+                    status: pending
+                    chain: tron
+                    tokenType: usdt
+                    toAddress: 'TXYZa1b2c3d4e5f6g7h8i9j0k1l2m3n4o5'
+                    recipientName: Mehmet Kaya
+                    merchantReference: payout-affiliate-67890
+                    amount: 100000
+                    netAmount: 97000
+                    commission: 3000
+                    currency: TRY
+                    description: Affiliate commission payout
+                    metadata:
+                      affiliateId: 'aff-789'
+                    providerReference: null
+                    estimatedProcessingTime: 'Queued for blockchain processing (typically 5-30 minutes)'
+                    createdAt: '2025-01-20T12:15:00.000Z'
+                    processedAt: null
+                    completedAt: null
+        '200':
+          description: Idempotent response - withdrawal already exists with this idempotency key (cached response)
+          headers:
+            X-Idempotency-Key:
+              $ref: '#/components/headers/IdempotencyKeyResponse'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CryptoWithdrawalResource'
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                missingIdempotencyKey:
+                  summary: Missing idempotency key
+                  value:
+                    error:
+                      code: MISSING_IDEMPOTENCY_KEY
+                      message: X-Idempotency-Key header is required
+                tokenNotSupported:
+                  summary: Token not supported on chain
+                  value:
+                    error:
+                      code: CRYPTO_WITHDRAWAL_TOKEN_NOT_SUPPORTED_ON_CHAIN
+                      message: Token btc is not supported on eth chain
+                      details:
+                        chain: eth
+                        tokenType: btc
+                invalidAddress:
+                  summary: Invalid destination address
+                  value:
+                    error:
+                      code: CRYPTO_WITHDRAWAL_INVALID_ADDRESS
+                      message: Invalid Ethereum address format. Must be a valid checksummed address starting with 0x
+                      details:
+                        address: '0xinvalid'
+                        chain: eth
+                amountTooLow:
+                  summary: Amount below minimum
+                  value:
+                    error:
+                      code: CRYPTO_WITHDRAWAL_AMOUNT_TOO_LOW
+                      message: Amount is below minimum withdrawal threshold. Minimum 10000 minor units
+                      details:
+                        requestedAmount: 5000
+                        minimumAmount: 10000
+                        tokenType: usdt
+                        chain: eth
+                priceUnavailable:
+                  summary: Price oracle unavailable
+                  value:
+                    error:
+                      code: CRYPTO_PRICE_UNAVAILABLE
+                      message: Unable to determine cryptocurrency price at this time. Please try again later.
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          description: Unprocessable entity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                insufficientBalance:
+                  summary: Insufficient crypto balance
+                  value:
+                    error:
+                      code: CRYPTO_WITHDRAWAL_INSUFFICIENT_BALANCE
+                      message: Insufficient eth native balance. Please check your available balance and try again.
+                      details:
+                        requestedAmount: 100000
+                        chain: eth
+                        tokenType: native
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /payments/{paymentId}:
+    get:
+      tags:
+        - Payments
+      summary: Retrieve a payment by ID
+      description: |
+        Fetch the latest state of a deposit, withdrawal, or crypto payout. Use the `paymentId` and `status` fields to
+        reconcile against webhook notifications.
+
+        **Supported Payment Types:**
+        - Deposits (bank transfer, credit card, crypto deposits)
+        - Withdrawals (bank transfer, crypto withdrawals to customer)
+        - Crypto Payouts (merchant withdrawals to own blockchain address)
+      security:
+        - ApiKeyAuth: []
+          MerchantIdAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PaymentId'
+      responses:
+        '200':
+          description: Payment resource
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentResource'
+              examples:
+                completed:
+                  summary: Deposit completed after customer checkout
+                  value:
+                    paymentId: pay_01H9YE1N5CB3X7S9HESY7Y5XGK
+                    type: deposit
+                    status: succeeded
+                    paymentMethod: bank_transfer
+                    merchantReference: order-2024-000045
+                    amount: 12550
+                    currency: TRY
+                    paymentPageUrl: https://pay.payinextra.example.com/checkout/pay_01H9YE1N5CB3X7S9HESY7Y5XGK
+                    returnUrl: https://merchant.example.com/payments/return/deposit
+                    metadata:
+                      plan: premium
+                      cartId: cart-8GQ39
+                    customer:
+                      name: Alex Rivers
+                      email: alex.rivers@example.com
+                      reference: user-1742
+                    expiresAt: 2024-05-03T10:15:30Z
+                    createdAt: 2024-05-03T09:15:30Z
+                    updatedAt: 2024-05-03T09:18:07Z
+                cryptoPayout:
+                  summary: Crypto payout completed with blockchain confirmation
+                  value:
+                    paymentId: pay_crypto_01HQWE789
+                    type: crypto_payout
+                    status: succeeded
+                    chain: eth
+                    tokenType: usdt
+                    amount: 500000
+                    toAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb7'
+                    merchantReference: settlement-2024-03
+                    metadata:
+                      purpose: Monthly settlement
+                      invoiceId: INV-2024-001
+                    createdAt: '2024-05-03T10:00:00Z'
+                    approvedAt: '2024-05-03T11:00:00Z'
+                    approvedBy:
+                      id: admin_123
+                      name: Admin User
+                      email: admin@merchant.com
+                    processedAt: '2024-05-03T11:05:00Z'
+                    completedAt: '2024-05-03T11:15:00Z'
+                    txHash: '0xabc123def456789012345678901234567890abcdef1234567890abcdef123456'
+                    blockNumber: 12345678
+                    confirmations: 12
+                    confirmationsRequired: 12
+                    explorerUrl: 'https://etherscan.io/tx/0xabc123def456...'
+                    estimatedGas: 21000
+                    actualGas: 19500
+                    failureCode: null
+                    failureReason: null
+                    estimatedProcessingTime: 'Completed'
+                    requiresApproval: false
+                cryptoDeposit:
+                  summary: Crypto deposit confirmed on blockchain
+                  value:
+                    paymentId: dep_crypto_01HQAB123
+                    type: crypto_deposit
+                    status: succeeded
+                    chain: tron
+                    tokenType: usdt
+                    depositAddress: 'TXYZa1b2c3d4e5f6g7h8i9j0k1l2m3n4o5'
+                    expectedCryptoAmount: '1000000'
+                    expectedCryptoFormatted: '1.0 USDT'
+                    qrCodeData: 'tron:TXYZa1b2c3d4e5f6g7h8i9j0k1l2m3n4o5?amount=1000000'
+                    merchantReference: order-12345
+                    amount: 35000
+                    currency: TRY
+                    customer:
+                      name: 'Test Customer'
+                      email: 'customer@example.com'
+                      reference: 'user-5678'
+                    metadata:
+                      orderId: 'ORD-123'
+                      productName: 'Premium Plan'
+                    txHash: 'abc123def456789012345678901234567890abcdef1234567890abcdef123456'
+                    blockNumber: 98765432
+                    confirmations: 20
+                    confirmationsRequired: 20
+                    explorerUrl: 'https://tronscan.org/#/transaction/abc123def456789012345678901234567890abcdef1234567890abcdef123456'
+                    paymentPageUrl: 'https://pay.payinextra.example.com/crypto-deposit/dep_crypto_01HQAB123'
+                    expiresAt: '2024-05-03T12:30:00Z'
+                    createdAt: '2024-05-03T12:00:00Z'
+                    updatedAt: '2024-05-03T12:05:23Z'
+                    completedAt: '2024-05-03T12:05:23Z'
+                cryptoWithdrawal:
+                  summary: Crypto withdrawal to customer completed
+                  value:
+                    paymentId: wth_crypto_01HQCD456
+                    type: crypto_withdrawal
+                    status: succeeded
+                    chain: bnb
+                    tokenType: usdt
+                    toAddress: '0x9876fedcba0123456789abcdef0123456789abcd'
+                    recipientName: 'Customer Name'
+                    merchantReference: refund-67890
+                    description: 'Refund for cancelled order #12345'
+                    amount: 50000
+                    netAmount: 48500
+                    commission: 1500
+                    currency: TRY
+                    metadata:
+                      refundReason: 'Customer cancellation'
+                      originalOrderId: 'ORD-12345'
+                    txHash: '0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210'
+                    blockNumber: 11223344
+                    confirmations: 15
+                    confirmationsRequired: 15
+                    explorerUrl: 'https://bscscan.com/tx/0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210'
+                    estimatedProcessingTime: 'Completed'
+                    createdAt: '2024-05-03T13:00:00Z'
+                    updatedAt: '2024-05-03T13:05:15Z'
+                    completedAt: '2024-05-03T13:05:15Z'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+components:
+  schemas:
+    DepositRequest:
+      type: object
+      required:
+        - amount
+        - currency
+        - merchantReference
+        - paymentMethod
+      properties:
+        amount:
+          type: integer
+          minimum: 1
+          description: Amount expressed in minor units (kuruş). For example, `12550` equals TRY 125.50.
+          example: 12550
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+        paymentMethod:
+          type: string
+          description: |
+            Payment route the customer will use to complete the deposit.
+
+            **Customer data requirements by method**:
+            - `bank_transfer`: customer.name is REQUIRED, others optional
+            - `credit_card_tr`: all customer fields optional, cardDetails optional
+            - `credit_card_international`: all customer fields optional, cardDetails optional
+
+            **Data storage**:
+            When customer data is provided, PayinExtra automatically stores it securely:
+            - Identification numbers: encrypted at rest
+            - IBANs: captured from bank transfer webhooks, encrypted
+            - Card details: encrypted with BIN/last4 for risk analysis
+
+            Currently only `bank_transfer` (havale) is active in production;
+            credit card options become available once enabled on your merchant panel.
+          enum:
+            - bank_transfer
+            - credit_card_tr
+            - credit_card_international
+          example: bank_transfer
+        merchantReference:
+          type: string
+          maxLength: 128
+          description: Merchant supplied unique identifier for the user or order.
+          example: order-2024-000045
+        customer:
+          $ref: '#/components/schemas/Customer'
+        cardDetails:
+          $ref: '#/components/schemas/CardDetails'
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+          description: Arbitrary key-value pairs (strings only) stored with the payment.
+    WithdrawalRequest:
+      type: object
+      description: |
+        Withdrawal payouts currently settle only via bank transfer (havale).
+      required:
+        - amount
+        - currency
+        - merchantReference
+        - destination
+        - payoutMethod
+      properties:
+        amount:
+          type: integer
+          minimum: 1
+          description: Amount expressed in minor units (kuruş). For example, `25000` equals TRY 250.00.
+          example: 25000
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+        merchantReference:
+          type: string
+          maxLength: 128
+          description: Merchant supplied unique identifier for the payout.
+          example: withdrawal-2024-0088
+        destination:
+          $ref: '#/components/schemas/BankAccountDestination'
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+          description: Arbitrary contextual strings you want echoed in webhooks.
+        payoutMethod:
+          type: string
+          description: Payout channel used for this withdrawal. Currently only `havale` bank transfer is available.
+          enum:
+            - havale
+    CryptoPayoutRequest:
+      type: object
+      required:
+        - amount
+        - chain
+        - tokenType
+        - merchantReference
+      properties:
+        amount:
+          type: integer
+          minimum: 1
+          description: |
+            Amount in minor units specific to the token.
+            - Native tokens (ETH, BNB, MATIC, TRX): varies by chain (18 or 6 decimals)
+            - Stablecoins (USDT, USDC): 6 decimals
+
+            Examples:
+            - 1000000 USDT minor units = 1.0 USDT (6 decimals)
+            - 500000000000000000 ETH minor units = 0.5 ETH (18 decimals)
+            - 10000000 TRX minor units = 10 TRX (6 decimals)
+          example: 1000000000
+        chain:
+          $ref: '#/components/schemas/ChainType'
+        tokenType:
+          $ref: '#/components/schemas/TokenType'
+        merchantReference:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: |
+            Unique reference for this payout in your system. Used for reconciliation and idempotency.
+            Must be unique across all your crypto payouts.
+          example: payout-2024-001
+        toAddress:
+          type: string
+          minLength: 10
+          maxLength: 128
+          description: |
+            Optional blockchain address to receive the payout. If not provided, uses your configured
+            payout address for the specified chain from merchant settings.
+
+            **Address Formats:**
+            - **EVM chains (eth, bnb, polygon)**: 0x-prefixed hex string, 42 characters (e.g., 0x742d35Cc...)
+            - **Tron (tron)**: Base58 encoded, starts with 'T', 34 characters (e.g., THPvaUhoh2Qn2y9THCZML...)
+          example: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb'
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Optional key-value pairs for your own context. These will be included in webhook notifications.
+            All values must be strings.
+          example:
+            purpose: Monthly settlement
+            invoiceId: INV-2024-001
+    CryptoPayoutResource:
+      type: object
+      required:
+        - payoutId
+        - type
+        - status
+        - chain
+        - tokenType
+        - amount
+        - toAddress
+        - merchantReference
+        - createdAt
+        - confirmations
+        - confirmationsRequired
+        - estimatedProcessingTime
+        - requiresApproval
+      properties:
+        payoutId:
+          type: string
+          description: Unique identifier for this crypto payout
+          example: payout_abc123def456
+        type:
+          type: string
+          enum:
+            - crypto_payout
+          description: Resource type (always 'crypto_payout')
+        status:
+          $ref: '#/components/schemas/CryptoPayoutStatus'
+        chain:
+          $ref: '#/components/schemas/ChainType'
+        tokenType:
+          $ref: '#/components/schemas/TokenType'
+        amount:
+          type: integer
+          description: Amount in minor units (as specified in request)
+          example: 1000000000
+        toAddress:
+          type: string
+          description: Destination blockchain address
+          example: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb'
+        merchantReference:
+          type: string
+          description: Your unique reference for this payout
+          example: payout-2024-001
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+          description: Custom metadata provided in request
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp when payout was created
+          example: '2024-03-15T10:30:00.000Z'
+        approvedAt:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp when payout was approved by admin
+          nullable: true
+          example: '2024-03-15T11:00:00.000Z'
+        processedAt:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp when transaction was broadcast to blockchain
+          nullable: true
+          example: '2024-03-15T11:05:00.000Z'
+        completedAt:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp when transaction was confirmed on blockchain
+          nullable: true
+          example: '2024-03-15T11:20:00.000Z'
+        txHash:
+          type: string
+          description: Blockchain transaction hash (available when status is processing or succeeded)
+          nullable: true
+          example: '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'
+        blockNumber:
+          type: integer
+          description: Block number where transaction was included
+          nullable: true
+          example: 12345678
+        confirmations:
+          type: integer
+          description: Current number of block confirmations
+          example: 12
+        confirmationsRequired:
+          type: integer
+          description: Required confirmations for finality
+          example: 12
+        explorerUrl:
+          type: string
+          format: uri
+          description: Blockchain explorer URL for this transaction (available when txHash exists)
+          nullable: true
+          example: 'https://etherscan.io/tx/0x1234...cdef'
+        failureCode:
+          type: string
+          description: Error code if payout failed
+          nullable: true
+          example: INSUFFICIENT_GAS
+        failureReason:
+          type: string
+          description: Human-readable failure reason
+          nullable: true
+          example: 'Insufficient gas in hot wallet'
+        estimatedProcessingTime:
+          type: string
+          description: Human-readable estimate of processing time based on current status
+          example: 'Waiting for admin approval (typically 1-24 hours)'
+        requiresApproval:
+          type: boolean
+          description: Whether this payout requires admin approval (true for pending status)
+          example: true
+    CryptoDepositListItem:
+      type: object
+      description: Lightweight crypto deposit representation for list endpoints
+      required:
+        - depositId
+        - type
+        - status
+        - chain
+        - tokenType
+        - amount
+        - currency
+        - createdAt
+      properties:
+        depositId:
+          type: string
+          description: Unique identifier for this crypto deposit
+          example: dep_crypto_01HQWE123
+        type:
+          type: string
+          enum: [crypto_deposit]
+          description: Resource type
+        status:
+          type: string
+          enum: [pending, confirmed, succeeded, failed, expired]
+          description: Current deposit status
+        chain:
+          $ref: '#/components/schemas/ChainType'
+        tokenType:
+          $ref: '#/components/schemas/TokenType'
+        depositAddress:
+          type: string
+          description: Assigned blockchain address for deposit
+          nullable: true
+          example: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb7'
+        expectedCryptoAmount:
+          type: string
+          description: Expected crypto amount in minor units
+          nullable: true
+          example: '1000000'
+        expectedCryptoFormatted:
+          type: string
+          description: Human-readable crypto amount
+          nullable: true
+          example: '1.0 USDT'
+        merchantReference:
+          type: string
+          description: Merchant's unique reference
+          example: order-12345
+        amount:
+          type: integer
+          description: Fiat amount in minor units
+          example: 100000
+        currency:
+          type: string
+          description: Fiat currency code
+          example: TRY
+        expiresAt:
+          type: string
+          format: date-time
+          description: When deposit address expires
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        txHash:
+          type: string
+          description: Blockchain transaction hash
+          nullable: true
+        confirmations:
+          type: integer
+          description: Number of confirmations
+          example: 12
+        explorerUrl:
+          type: string
+          description: Blockchain explorer URL
+          nullable: true
+    CryptoWithdrawalListItem:
+      type: object
+      description: Lightweight crypto withdrawal representation for list endpoints
+      required:
+        - withdrawalId
+        - type
+        - status
+        - chain
+        - tokenType
+        - amount
+        - netAmount
+        - commission
+        - currency
+        - createdAt
+      properties:
+        withdrawalId:
+          type: string
+          description: Unique identifier for this crypto withdrawal
+          example: wth_crypto_01HQWE123
+        type:
+          type: string
+          enum: [crypto_withdrawal]
+          description: Resource type
+        status:
+          type: string
+          enum: [pending, processing, succeeded, failed, cancelled]
+          description: Current withdrawal status
+        chain:
+          $ref: '#/components/schemas/ChainType'
+        tokenType:
+          $ref: '#/components/schemas/TokenType'
+        toAddress:
+          type: string
+          description: Destination blockchain address
+          example: 'TXYZa1b2c3d4e5f6g7h8i9j0k1l2m3n4o5'
+        recipientName:
+          type: string
+          description: Recipient name
+          nullable: true
+        merchantReference:
+          type: string
+          description: Merchant's unique reference
+          example: refund-12345
+        amount:
+          type: integer
+          description: Gross amount in minor units
+          example: 50000
+        netAmount:
+          type: integer
+          description: Net amount after commission
+          example: 48500
+        commission:
+          type: integer
+          description: Commission amount
+          example: 1500
+        currency:
+          type: string
+          description: Fiat currency code
+          example: TRY
+        description:
+          type: string
+          description: Withdrawal description
+          nullable: true
+        providerReference:
+          type: string
+          description: Provider transaction reference
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+          nullable: true
+        txHash:
+          type: string
+          description: Blockchain transaction hash
+          nullable: true
+        explorerUrl:
+          type: string
+          description: Blockchain explorer URL
+          nullable: true
+    CryptoPayoutListItem:
+      type: object
+      description: Lightweight crypto payout representation for list endpoints
+      required:
+        - payoutId
+        - type
+        - status
+        - chain
+        - tokenType
+        - amount
+        - toAddress
+        - createdAt
+        - confirmations
+        - requiresApproval
+      properties:
+        payoutId:
+          type: string
+          description: Unique identifier for this crypto payout
+          example: pay_crypto_01HQWE123
+        type:
+          type: string
+          enum: [crypto_payout]
+          description: Resource type
+        status:
+          type: string
+          enum: [pending, approved, processing, succeeded, failed]
+          description: Current payout status
+        chain:
+          $ref: '#/components/schemas/ChainType'
+        tokenType:
+          $ref: '#/components/schemas/TokenType'
+        amount:
+          type: integer
+          description: Amount in minor units
+          example: 500000
+        toAddress:
+          type: string
+          description: Destination blockchain address
+          example: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb7'
+        merchantReference:
+          type: string
+          description: Merchant's unique reference
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        approvedAt:
+          type: string
+          format: date-time
+          nullable: true
+        processedAt:
+          type: string
+          format: date-time
+          nullable: true
+        completedAt:
+          type: string
+          format: date-time
+          nullable: true
+        txHash:
+          type: string
+          description: Blockchain transaction hash
+          nullable: true
+        confirmations:
+          type: integer
+          description: Number of confirmations
+          example: 12
+        explorerUrl:
+          type: string
+          description: Blockchain explorer URL
+          nullable: true
+        requiresApproval:
+          type: boolean
+          description: Whether payout requires admin approval
+          example: true
+    PaginationMetadata:
+      type: object
+      description: Pagination metadata for list responses
+      required:
+        - page
+        - limit
+        - total
+        - totalPages
+        - hasNext
+        - hasPrev
+      properties:
+        page:
+          type: integer
+          description: Current page number (1-indexed)
+          example: 1
+        limit:
+          type: integer
+          description: Items per page
+          example: 20
+        total:
+          type: integer
+          description: Total number of items
+          example: 156
+        totalPages:
+          type: integer
+          description: Total number of pages
+          example: 8
+        hasNext:
+          type: boolean
+          description: Whether there is a next page
+          example: true
+        hasPrev:
+          type: boolean
+          description: Whether there is a previous page
+          example: false
+    CryptoTransactionTotals:
+      type: object
+      description: Sum totals for crypto transaction amounts
+      required:
+        - totalAmount
+        - pendingAmount
+        - succeededAmount
+      properties:
+        totalAmount:
+          type: integer
+          description: Total amount across all statuses (in minor units)
+          example: 1500000
+        pendingAmount:
+          type: integer
+          description: Total amount in pending status (in minor units)
+          example: 500000
+        succeededAmount:
+          type: integer
+          description: Total amount in succeeded status (in minor units)
+          example: 1000000
+    CryptoDepositRequest:
+      type: object
+      required:
+        - amount
+        - currency
+        - chain
+        - tokenType
+        - merchantReference
+      properties:
+        amount:
+          type: integer
+          minimum: 100
+          maximum: 10000000
+          description: |
+            Amount in fiat minor units (TRY kuruş). System will calculate equivalent crypto amount.
+            - Minimum: 100 (1.00 TRY)
+            - Maximum: 10000000 (100,000.00 TRY)
+          example: 100000
+        currency:
+          type: string
+          enum:
+            - TRY
+          description: Fiat currency code (currently only TRY supported)
+          example: TRY
+        chain:
+          $ref: '#/components/schemas/ChainType'
+        tokenType:
+          $ref: '#/components/schemas/TokenType'
+        merchantReference:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: |
+            Unique reference for this deposit in your system. Used for reconciliation and idempotency.
+            Must be unique across all your crypto deposits.
+          example: order-12345
+        customer:
+          $ref: '#/components/schemas/Customer'
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Optional key-value pairs for your own context. These will be included in webhook notifications.
+            All values must be strings.
+          example:
+            orderId: '12345'
+            productId: 'premium-package'
+    CryptoDepositResource:
+      type: object
+      required:
+        - depositId
+        - type
+        - status
+        - chain
+        - tokenType
+        - depositAddress
+        - expectedCryptoAmount
+        - expectedCryptoFormatted
+        - amount
+        - currency
+        - merchantReference
+        - createdAt
+      properties:
+        depositId:
+          type: string
+          description: Unique identifier for this crypto deposit
+          example: dep_crypto_01HQWE123
+        type:
+          type: string
+          enum:
+            - crypto_deposit
+          description: Resource type (always 'crypto_deposit')
+        status:
+          type: string
+          enum:
+            - pending
+            - confirmed
+            - succeeded
+            - failed
+            - expired
+          description: |
+            Current status of the deposit:
+            - `pending`: Address assigned, waiting for customer payment
+            - `confirmed`: Transaction detected on blockchain
+            - `succeeded`: Deposit confirmed and credited
+            - `failed`: Deposit failed
+            - `expired`: Deposit expired without payment
+          example: pending
+        chain:
+          $ref: '#/components/schemas/ChainType'
+        tokenType:
+          $ref: '#/components/schemas/TokenType'
+        depositAddress:
+          type: string
+          description: Blockchain address where customer should send crypto
+          example: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb'
+        expectedCryptoAmount:
+          type: string
+          description: Expected crypto amount in minor units (wei for ETH, etc.)
+          example: '500000000000000000'
+        expectedCryptoFormatted:
+          type: string
+          description: Human-readable formatted crypto amount with symbol
+          example: '0.5 ETH'
+        qrCodeData:
+          type: string
+          description: QR code data for easy payment (EIP-681 or similar format)
+          example: 'ethereum:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb?value=500000000000000000'
+        expiresAt:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp when this deposit expires
+          nullable: true
+          example: '2025-01-20T12:30:00.000Z'
+        paymentPageUrl:
+          type: string
+          format: uri
+          description: Hosted payment page URL with instructions and QR code
+          nullable: true
+          example: 'https://payinextra.com/pay/dep_crypto_01HQWE123'
+        explorerUrl:
+          type: string
+          format: uri
+          description: Blockchain explorer URL for this address
+          nullable: true
+          example: 'https://etherscan.io/address/0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb'
+        merchantReference:
+          type: string
+          description: Your unique reference for this deposit
+          example: order-12345
+        amount:
+          type: integer
+          description: Fiat amount in minor units (as specified in request)
+          example: 100000
+        currency:
+          type: string
+          description: Fiat currency code
+          example: TRY
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+          description: Custom metadata you provided in the request
+          example:
+            orderId: '12345'
+            productId: 'premium-package'
+        createdAt:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp when deposit was created
+          example: '2025-01-20T12:00:00.000Z'
+    CryptoWithdrawalRequest:
+      type: object
+      required:
+        - amount
+        - currency
+        - chain
+        - tokenType
+        - destination
+        - merchantReference
+      properties:
+        amount:
+          type: integer
+          minimum: 100
+          maximum: 10000000
+          description: |
+            Amount in fiat minor units (TRY kuruş). System will calculate equivalent crypto amount.
+            - Minimum: 100 (1.00 TRY)
+            - Maximum: 10000000 (100,000.00 TRY)
+          example: 50000
+        currency:
+          type: string
+          enum:
+            - TRY
+          description: Fiat currency code (currently only TRY supported)
+          example: TRY
+        chain:
+          $ref: '#/components/schemas/ChainType'
+        tokenType:
+          $ref: '#/components/schemas/TokenType'
+        destination:
+          type: object
+          required:
+            - address
+          properties:
+            address:
+              type: string
+              minLength: 10
+              maxLength: 128
+              description: |
+                Blockchain address where crypto will be sent (customer's wallet).
+
+                **Address Formats:**
+                - **EVM chains (eth, bnb, polygon)**: 0x-prefixed hex string, 42 characters
+                - **Tron (tron)**: Base58 encoded, starts with 'T', 34 characters
+              example: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb'
+            name:
+              type: string
+              minLength: 1
+              maxLength: 255
+              description: Optional recipient name for tracking
+              example: Ahmet Yılmaz
+        merchantReference:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: |
+            Unique reference for this withdrawal in your system. Used for reconciliation and idempotency.
+            Must be unique across all your crypto withdrawals.
+          example: refund-order-12345
+        customer:
+          $ref: '#/components/schemas/Customer'
+        description:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: Optional description/reason for this withdrawal
+          example: Refund for cancelled order #12345
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Optional key-value pairs for your own context. These will be included in webhook notifications.
+            All values must be strings.
+          example:
+            orderId: '12345'
+            reason: customer-request
+    CryptoWithdrawalResource:
+      type: object
+      required:
+        - withdrawalId
+        - type
+        - status
+        - chain
+        - tokenType
+        - toAddress
+        - amount
+        - netAmount
+        - commission
+        - currency
+        - merchantReference
+        - estimatedProcessingTime
+        - createdAt
+      properties:
+        withdrawalId:
+          type: string
+          description: Unique identifier for this crypto withdrawal
+          example: wth_crypto_01HQWE123
+        type:
+          type: string
+          enum:
+            - crypto_withdrawal
+          description: Resource type (always 'crypto_withdrawal')
+        status:
+          type: string
+          enum:
+            - pending
+            - processing
+            - succeeded
+            - failed
+          description: |
+            Current status of the withdrawal:
+            - `pending`: Created, queued for processing
+            - `processing`: Transaction being broadcast to blockchain
+            - `succeeded`: Transaction confirmed on blockchain
+            - `failed`: Transaction failed
+          example: pending
+        chain:
+          $ref: '#/components/schemas/ChainType'
+        tokenType:
+          $ref: '#/components/schemas/TokenType'
+        toAddress:
+          type: string
+          description: Destination blockchain address (customer's wallet)
+          example: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb'
+        recipientName:
+          type: string
+          description: Recipient name if provided
+          nullable: true
+          example: Ahmet Yılmaz
+        merchantReference:
+          type: string
+          description: Your unique reference for this withdrawal
+          example: refund-order-12345
+        amount:
+          type: integer
+          description: Gross amount in fiat minor units (before commission)
+          example: 50000
+        netAmount:
+          type: integer
+          description: Net amount sent in fiat minor units (after commission)
+          example: 48500
+        commission:
+          type: integer
+          description: Commission charged in fiat minor units
+          example: 1500
+        currency:
+          type: string
+          description: Fiat currency code
+          example: TRY
+        description:
+          type: string
+          description: Withdrawal description/reason if provided
+          nullable: true
+          example: Refund for cancelled order #12345
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+          description: Custom metadata you provided in the request
+          example:
+            orderId: '12345'
+            reason: customer-request
+        providerReference:
+          type: string
+          description: Provider's reference for this withdrawal
+          nullable: true
+          example: null
+        estimatedProcessingTime:
+          type: string
+          description: Human-readable estimate of processing time based on current status
+          example: 'Queued for blockchain processing (typically 5-30 minutes)'
+        createdAt:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp when withdrawal was created
+          example: '2025-01-20T12:00:00.000Z'
+        processedAt:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp when withdrawal processing started
+          nullable: true
+          example: null
+        completedAt:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp when withdrawal completed
+          nullable: true
+          example: null
+    ChainType:
+      type: string
+      enum:
+        - eth
+        - bnb
+        - polygon
+        - tron
+      description: |
+        Blockchain network identifier
+        - `eth`: Ethereum mainnet
+        - `bnb`: BNB Smart Chain (formerly BSC)
+        - `polygon`: Polygon (formerly Matic)
+        - `tron`: Tron mainnet
+    TokenType:
+      type: string
+      enum:
+        - native
+        - usdt
+        - usdc
+      description: |
+        Token type on the specified chain
+        - `native`: Chain's native token (ETH, BNB, MATIC, or TRX)
+        - `usdt`: Tether USD stablecoin
+        - `usdc`: USD Coin stablecoin
+    CryptoPayoutStatus:
+      type: string
+      enum:
+        - pending
+        - approved
+        - processing
+        - succeeded
+        - failed
+      description: |
+        Crypto payout lifecycle status
+        - `pending`: Created, awaiting admin approval
+        - `approved`: Approved by admin, queued for blockchain processing
+        - `processing`: Transaction being broadcast to blockchain
+        - `succeeded`: Transaction confirmed on blockchain
+        - `failed`: Transaction failed or rejected by admin
+    PaymentResource:
+      type: object
+      required:
+        - paymentId
+        - type
+        - status
+        - merchantReference
+        - amount
+        - currency
+        - createdAt
+      properties:
+        paymentId:
+          type: string
+          description: PayinExtra identifier for the payment resource.
+          example: pay_01H9YE1N5CB3X7S9HESY7Y5XGK
+        type:
+          type: string
+          description: Payment category.
+          enum:
+            - deposit
+            - withdrawal
+        status:
+          type: string
+          description: Current processing state of the payment.
+          enum:
+            - pending
+            - awaiting_redirect
+            - processing
+            - succeeded
+            - failed
+            - cancelled
+        paymentMethod:
+          type: string
+          description: |
+            Deposit payment route. Present for deposits only. Currently only `bank_transfer` (havale) is
+            active in production.
+          enum:
+            - bank_transfer
+            - credit_card_tr
+            - credit_card_international
+        merchantReference:
+          type: string
+          description: Merchant supplied identifier used to map the customer or order.
+        amount:
+          type: integer
+          description: Monetary amount in minor currency units.
+          example: 12550
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+        paymentPageUrl:
+          type: string
+          format: uri
+          description: Hosted checkout URL to redirect the customer to. Present for deposits.
+        returnUrl:
+          type: string
+          format: uri
+          description: Merchant return URL configured in the PayinExtra dashboard.
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+          description: Merchant supplied metadata.
+        payoutMethod:
+          type: string
+          nullable: true
+          description: Payout channel used for withdrawals. Currently only `havale` is available.
+          enum:
+            - havale
+        customer:
+          description: Customer information associated with the payment.
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Customer'
+        expiresAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: ISO-8601 timestamp for when the payment session expires.
+        createdAt:
+          type: string
+          format: date-time
+          description: ISO-8601 timestamp when the payment was created.
+        updatedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: ISO-8601 timestamp when the payment was last updated.
+    Customer:
+      type: object
+      description: |
+        Optional end-customer context stored with the payment.
+
+        **Requirements by payment method**:
+        - `bank_transfer`: name is REQUIRED
+        - `credit_card_tr` / `credit_card_international`: all fields optional
+      properties:
+        reference:
+          type: string
+          description: Merchant identifier for the customer, user, or account.
+          example: user-1742
+        name:
+          type: string
+          description: Customer full name. REQUIRED for bank_transfer payments.
+          example: Alex Rivers
+        email:
+          type: string
+          format: email
+          description: Customer email address.
+          example: alex.rivers@example.com
+        phone:
+          type: string
+          description: Customer phone number in E.164 format.
+          example: '+17035551234'
+        identificationNumber:
+          type: string
+          description: |
+            Customer national ID or tax number (TC Kimlik for Turkey).
+            Stored encrypted at rest. Optional for all payment methods.
+          example: '12345678901'
+          minLength: 10
+          maxLength: 20
+      additionalProperties: false
+    CardDetails:
+      type: object
+      description: |
+        Card payment details for credit card payments. Provide only when using
+        `credit_card_tr` or `credit_card_international` payment methods.
+        Card data is stored encrypted and will be hashed for risk analysis.
+      properties:
+        cardNumber:
+          type: string
+          description: Full card PAN (13-19 digits). Will be encrypted at rest.
+          example: '4242424242424242'
+          pattern: '^\d{13,19}$'
+        cardholderName:
+          type: string
+          description: Name exactly as it appears on the card.
+          example: 'ALEX RIVERS'
+          maxLength: 255
+        cardExpMonth:
+          type: integer
+          description: Card expiry month (1-12).
+          minimum: 1
+          maximum: 12
+          example: 12
+        cardExpYear:
+          type: integer
+          description: Card expiry year (4 digits).
+          minimum: 2024
+          maximum: 2099
+          example: 2025
+        cvv:
+          type: string
+          description: Card verification value (3-4 digits).
+          pattern: '^\d{3,4}$'
+          example: '123'
+      additionalProperties: false
+    BankAccountDestination:
+      type: object
+      required:
+        - accountName
+        - iban
+      description: Destination bank account for withdrawal payouts.
+      properties:
+        accountName:
+          type: string
+          description: Account holder name on the bank account.
+        iban:
+          type: string
+          description: IBAN of the destination account.
+        bankName:
+          type: string
+          description: Issuing bank name.
+      additionalProperties: false
+    WebhookEvent:
+      type: object
+      required:
+        - event
+        - paymentId
+        - type
+        - status
+        - merchantReference
+        - amount
+        - currency
+        - occurredAt
+      properties:
+        event:
+          type: string
+          description: |
+            Event identifier describing the payment lifecycle change.
+
+            **Deposit Events**:
+            - `deposit.pending`: Deposit created, awaiting customer payment
+            - `deposit.succeeded`: Customer paid successfully, funds credited to merchant
+            - `deposit.failed`: Deposit processing failed
+            - `deposit.refunded`: Deposit refunded to customer
+            - `deposit.requires_action`: Payment data mismatch, requires manual review/refund
+
+            **Withdrawal Events**:
+            - `withdrawal.pending`: Withdrawal requested, awaiting approval
+            - `withdrawal.processing`: Withdrawal approved and being processed
+            - `withdrawal.succeeded`: Withdrawal completed, funds sent to destination
+            - `withdrawal.failed`: Withdrawal processing failed
+            - `withdrawal.cancelled`: Withdrawal cancelled by admin or merchant
+
+            **Payout Events**:
+            - `payout.pending`: Payout requested, awaiting approval
+            - `payout.processing`: Payout approved and being processed
+            - `payout.succeeded`: Payout completed, funds sent to destination
+            - `payout.failed`: Payout processing failed
+
+            **Crypto Payout Events**:
+            - `crypto_payout.pending`: Payout created, awaiting admin approval
+            - `crypto_payout.approved`: Payout approved by admin, queued for blockchain processing
+            - `crypto_payout.processing`: Transaction being broadcast to blockchain
+            - `crypto_payout.succeeded`: Transaction confirmed on blockchain with required confirmations
+            - `crypto_payout.failed`: Transaction failed or rejected by admin
+
+            **Crypto Deposit Events**:
+            - `crypto_deposit.pending`: Address assigned, awaiting customer to send crypto
+            - `crypto_deposit.confirmed`: Transaction detected on blockchain, awaiting confirmations
+            - `crypto_deposit.succeeded`: Required confirmations received, balance credited
+            - `crypto_deposit.failed`: Deposit failed (wrong amount, network error, etc.)
+            - `crypto_deposit.expired`: Deposit expired without payment
+
+            **Crypto Withdrawal Events**:
+            - `crypto_withdrawal.pending`: Withdrawal created, queued for blockchain processing
+            - `crypto_withdrawal.processing`: Transaction being broadcast to blockchain
+            - `crypto_withdrawal.succeeded`: Transaction confirmed on blockchain
+            - `crypto_withdrawal.failed`: Transaction failed (insufficient gas, invalid address, etc.)
+          enum:
+            - deposit.pending
+            - deposit.succeeded
+            - deposit.failed
+            - deposit.refunded
+            - deposit.requires_action
+            - withdrawal.pending
+            - withdrawal.processing
+            - withdrawal.succeeded
+            - withdrawal.failed
+            - withdrawal.cancelled
+            - payout.pending
+            - payout.processing
+            - payout.succeeded
+            - payout.failed
+            - crypto_payout.pending
+            - crypto_payout.approved
+            - crypto_payout.processing
+            - crypto_payout.succeeded
+            - crypto_payout.failed
+            - crypto_deposit.pending
+            - crypto_deposit.confirmed
+            - crypto_deposit.succeeded
+            - crypto_deposit.failed
+            - crypto_deposit.expired
+            - crypto_withdrawal.pending
+            - crypto_withdrawal.processing
+            - crypto_withdrawal.succeeded
+            - crypto_withdrawal.failed
+        paymentId:
+          type: string
+          description: PayinExtra payment identifier referenced in the API.
+        type:
+          type: string
+          enum:
+            - deposit
+            - withdrawal
+            - payout
+            - crypto_payout
+        status:
+          type: string
+          description: Latest status of the payment when the webhook was sent.
+        paymentMethod:
+          type: string
+          nullable: true
+          description: |
+            Deposit payment route when the event relates to a deposit. Currently only `bank_transfer`
+            (havale) is active in production.
+          enum:
+            - bank_transfer
+            - credit_card_tr
+            - credit_card_international
+        merchantReference:
+          type: string
+          description: Merchant supplied identifier echoed back.
+        amount:
+          type: integer
+          description: Monetary amount in minor currency units.
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+        payoutMethod:
+          type: string
+          nullable: true
+          description: Payout channel used for withdrawals. Currently only `havale` is available.
+          enum:
+            - havale
+        customer:
+          description: Customer information associated with the payment.
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Customer'
+        occurredAt:
+          type: string
+          format: date-time
+          description: ISO-8601 timestamp when PayinExtra emitted the event.
+        paymentPageUrl:
+          type: string
+          format: uri
+          nullable: true
+          description: Present for deposit events while awaiting completion.
+        returnUrl:
+          type: string
+          format: uri
+          nullable: true
+          description: Merchant return URL PayinExtra posts the same payload to after redirect.
+        chain:
+          type: string
+          nullable: true
+          description: |
+            Blockchain network for crypto payouts (only present for crypto_payout events).
+            One of: eth, bnb, polygon, tron
+          example: eth
+        tokenType:
+          type: string
+          nullable: true
+          description: |
+            Token type for crypto payouts (only present for crypto_payout events).
+            One of: native, usdt, usdc
+          example: usdt
+        toAddress:
+          type: string
+          nullable: true
+          description: |
+            Destination blockchain address for crypto payouts (only present for crypto_payout events).
+          example: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb'
+        txHash:
+          type: string
+          nullable: true
+          description: |
+            Blockchain transaction hash for crypto payouts (present for crypto_payout events when status is processing/succeeded).
+          example: '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'
+        blockNumber:
+          type: integer
+          nullable: true
+          description: |
+            Block number where transaction was included (present for crypto_payout events when confirmed).
+          example: 12345678
+        confirmations:
+          type: integer
+          nullable: true
+          description: |
+            Current number of block confirmations (present for crypto_payout events when processing/succeeded).
+          example: 12
+        explorerUrl:
+          type: string
+          format: uri
+          nullable: true
+          description: |
+            Blockchain explorer URL for the transaction (present for crypto_payout events when txHash exists).
+          example: 'https://etherscan.io/tx/0x1234...cdef'
+        failureCode:
+          type: string
+          nullable: true
+          description: |
+            Error code for failed crypto payouts (only present for crypto_payout.failed events).
+          example: INSUFFICIENT_GAS
+        failureReason:
+          type: string
+          nullable: true
+          description: |
+            Human-readable failure reason (only present for crypto_payout.failed events).
+          example: 'Insufficient gas in hot wallet'
+    ReturnRedirectPayload:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEvent'
+      description: Payload POSTed to the merchant's configured return URL after the customer flow, identical to the webhook body.
+    WebhookDelivery:
+      type: object
+      description: |
+        ## Webhook Delivery System
+
+        PayinExtra delivers webhooks via HTTP POST to your configured webhook URL with automatic retry on failure.
+
+        ### Retry Strategy (Exponential Backoff)
+        Failed webhook deliveries are automatically retried up to **7 times** (8 total attempts) with increasing delays:
+
+        | Attempt | Delay After Failure |
+        |---------|---------------------|
+        | 1       | Immediate           |
+        | 2       | 3 minutes           |
+        | 3       | 5 minutes           |
+        | 4       | 15 minutes          |
+        | 5       | 30 minutes          |
+        | 6       | 1 hour              |
+        | 7       | 3 hours             |
+        | 8       | 6 hours (final)     |
+
+        ### Request Details
+        - **Method**: `POST`
+        - **Timeout**: 10 seconds
+        - **Content-Type**: `application/json`
+        - **Success Criteria**: HTTP status `2xx` within timeout
+
+        ### Security Headers
+        Each webhook request includes these headers for verification:
+
+        - `X-Secret-Key`: Your webhook secret (for simple validation)
+        - `X-Webhook-Signature`: HMAC-SHA256 signature of request body (for cryptographic validation)
+        - `X-Webhook-Event`: Event type (e.g., `deposit.succeeded`)
+        - `X-Webhook-Id`: Unique delivery attempt identifier
+        - `X-Webhook-Timestamp`: Unix timestamp of delivery attempt
+        - `Content-Type`: `application/json`
+
+        ### Verification Options
+
+        **Option 1: Simple Secret Validation (Quick)**
+        ```python
+        def verify_webhook_simple(request_secret, configured_secret):
+            """Compare the X-Secret-Key header with your configured secret"""
+            return request_secret == configured_secret
+        ```
+
+        **Option 2: HMAC Signature Validation (Recommended - Prevents Tampering)**
+        ```python
+        import hmac
+        import hashlib
+
+        def verify_webhook_hmac(payload_body, signature, secret):
+            """Verify HMAC-SHA256 signature to ensure payload wasn't tampered with"""
+            expected = hmac.new(
+                secret.encode('utf-8'),
+                payload_body.encode('utf-8'),
+                hashlib.sha256
+            ).hexdigest()
+            return hmac.compare_digest(expected, signature)
+
+        # Example usage
+        secret_key = request.headers.get('X-Secret-Key')
+        signature = request.headers.get('X-Webhook-Signature')
+        payload_body = request.body
+
+        # Quick validation
+        if secret_key != YOUR_WEBHOOK_SECRET:
+            return 401  # Unauthorized
+
+        # Secure validation (recommended)
+        if not verify_webhook_hmac(payload_body, signature, YOUR_WEBHOOK_SECRET):
+            return 401  # Signature mismatch
+        ```
+
+        ### Best Practices
+        1. **Respond quickly**: Return `2xx` status immediately, process async
+        2. **Verify authenticity**: Validate `X-Secret-Key` or `X-Webhook-Signature` header
+        3. **Use HMAC for security**: HMAC validation prevents payload tampering
+        4. **Idempotency**: Use `paymentId` to prevent duplicate processing
+        5. **Monitor deliveries**: Check webhook logs in merchant panel
+        6. **Manual retry**: Failed webhooks can be manually retried from panel
+
+        ### Failure Handling
+        - After 8 failed attempts, delivery stops and status becomes `failed`
+        - You can manually retry from merchant panel or admin panel
+        - Check webhook delivery logs for error messages and HTTP responses
+      properties:
+        deliveryId:
+          type: string
+          description: Unique identifier for this delivery attempt
+        webhookId:
+          type: string
+          description: Merchant webhook configuration ID
+        attemptCount:
+          type: integer
+          description: Current attempt number (1-8)
+          minimum: 1
+          maximum: 8
+        status:
+          type: string
+          enum:
+            - pending
+            - delivered
+            - failed
+          description: |
+            Current delivery status:
+            - `pending`: Queued or being retried
+            - `delivered`: Successfully delivered (2xx response received)
+            - `failed`: All retry attempts exhausted
+        lastAttemptedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Timestamp of most recent delivery attempt
+        deliveredAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Timestamp when delivery succeeded
+        lastError:
+          type: string
+          nullable: true
+          description: Error message from most recent failed attempt
+    ErrorResponse:
+      type: object
+      required:
+        - error
+        - message
+      properties:
+        error:
+          type: string
+          description: Machine readable error identifier.
+          example: validation_error
+        message:
+          type: string
+          description: Human readable summary of the failure.
+          example: Amount must be greater than zero.
+        details:
+          type: array
+          description: Optional list of validation or processing issues.
+          items:
+            $ref: '#/components/schemas/ErrorDetail'
+        requestId:
+          type: string
+          description: PayinExtra request identifier for support traces.
+    ErrorDetail:
+      type: object
+      properties:
+        field:
+          type: string
+          description: Field name associated with the error, when applicable.
+        issue:
+          type: string
+          description: Machine readable issue category.
+          example: MIN_VALUE
+        message:
+          type: string
+          description: Human readable detail about the problem.
+    CurrencyCode:
+      type: string
+      enum:
+        - TRY
+      description: ISO-4217 three-letter currency code. PayinExtra currently supports only Turkish Lira (TRY).
+      example: TRY
+  responses:
+    BadRequest:
+      description: Invalid payload or malformed request.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            invalid:
+              summary: Amount is missing
+              value:
+                error: validation_error
+                message: amount is a required field
+                details:
+                  - field: amount
+                    issue: REQUIRED
+                    message: amount is a required field
+                requestId: req_01H9YEAXTGDCQW8QF6YF3B8S5N
+    Unauthorized:
+      description: Missing or invalid authentication headers.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            unauthorized:
+              summary: Authentication failed
+              value:
+                error: unauthorized
+                message: Invalid authentication credentials.
+                requestId: req_01H9YEAXTGDCQW8QF6YF3B8S5N
+    NotFound:
+      description: Resource was not found.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            missing:
+              summary: Payment does not exist
+              value:
+                error: not_found
+                message: Payment pay_01H9YE1N5CB3X7S9HESY7Y5XGK was not found.
+                requestId: req_01H9YEAXTGDCQW8QF6YF3B8S5N
+    Conflict:
+      description: Request conflicts with existing resources.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            duplicate:
+              summary: Duplicate idempotency key
+              value:
+                error: conflict
+                message: X-Idempotency-Key has already been used for a different payload.
+                requestId: req_01H9YEAXTGDCQW8QF6YF3B8S5N
+    UnprocessableEntity:
+      description: Validation rules failed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            validation:
+              summary: Validation errors on destination
+              value:
+                error: validation_error
+                message: Destination validation failed.
+                details:
+                  - field: destination.iban
+                    issue: INVALID
+                    message: IBAN format is invalid.
+                requestId: req_01H9YEAXTGDCQW8QF6YF3B8S5N
+    ValidationError:
+      description: Request validation failed due to invalid parameters.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            validation:
+              summary: Invalid query parameters
+              value:
+                error: validation_error
+                message: Query parameter validation failed.
+                details:
+                  - field: status
+                    issue: INVALID_ENUM
+                    message: Invalid status value. Must be one of pending, approved, processing, succeeded, failed.
+                requestId: req_01H9YEAXTGDCQW8QF6YF3B8S5N
+    Forbidden:
+      description: Access to resource is forbidden for this merchant.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            forbidden:
+              summary: Feature not enabled for merchant
+              value:
+                error: forbidden
+                message: This feature is not enabled for your merchant account.
+                requestId: req_01H9YEAXTGDCQW8QF6YF3B8S5N
+    RateLimited:
+      description: Too many requests were sent in a short time.
+      headers:
+        Retry-After:
+          description: Seconds until the next allowed request.
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            throttled:
+              summary: Merchant exceeded rate limits
+              value:
+                error: rate_limited
+                message: Too many requests. Try again later.
+                requestId: req_01H9YEAXTGDCQW8QF6YF3B8S5N
+    InternalError:
+      description: Unexpected error on PayinExtra servers.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            error:
+              summary: Unknown exception
+              value:
+                error: internal_error
+                message: An unexpected error occurred. Please retry later.
+                requestId: req_01H9YEAXTGDCQW8QF6YF3B8S5N
+  parameters:
+    PaymentId:
+      name: paymentId
+      in: path
+      required: true
+      description: PayinExtra payment identifier returned by create endpoints.
+      schema:
+        type: string
+    IdempotencyKey:
+      name: X-Idempotency-Key
+      in: header
+      required: true
+      description: Unique key per POST request to guarantee idempotency during retries.
+      schema:
+        type: string
+        maxLength: 255
+  headers:
+    X-Secret-Key:
+      description: Merchant secret used to authenticate webhook notifications. Configure this in the PayinExtra merchant panel.
+      schema:
+        type: string
+    IdempotencyKeyResponse:
+      description: The idempotency key that was used for this request. Echoed back in the response for confirmation.
+      schema:
+        type: string
+        maxLength: 128
+        example: '550e8400-e29b-41d4-a716-446655440000'
+  examples:
+    WebhookDepositSucceeded:
+      summary: Deposit completed successfully
+      value:
+        event: deposit.succeeded
+        paymentId: pay_01H9YE1N5CB3X7S9HESY7Y5XGK
+        type: deposit
+        status: succeeded
+        paymentMethod: bank_transfer
+        merchantReference: order-2024-000045
+        amount: 12550
+        currency: TRY
+        metadata:
+          plan: premium
+          cartId: cart-8GQ39
+        customer:
+          name: Alex Rivers
+          email: alex.rivers@example.com
+          reference: user-1742
+        occurredAt: 2024-05-03T09:18:07Z
+        paymentPageUrl: https://pay.payinextra.example.com/checkout/pay_01H9YE1N5CB3X7S9HESY7Y5XGK
+        returnUrl: https://merchant.example.com/payments/return/deposit
+    WebhookDepositFailed:
+      summary: Deposit failed to process
+      value:
+        event: deposit.failed
+        paymentId: pay_01H9YE2M4NC5Y8T0JFSZ8Z6YHL
+        type: deposit
+        status: failed
+        paymentMethod: credit_card_tr
+        merchantReference: order-2024-000046
+        amount: 25000
+        currency: TRY
+        metadata:
+          plan: basic
+        customer:
+          name: Elif Yilmaz
+          email: elif.yilmaz@example.com
+          reference: user-2458
+        occurredAt: 2024-05-03T10:25:13Z
+    WebhookDepositRequiresAction:
+      summary: Deposit requires manual review
+      value:
+        event: deposit.requires_action
+        paymentId: pay_01H9YE3N5OD6Z9U1KGTA9A7ZIM
+        type: deposit
+        status: requires_action
+        paymentMethod: bank_transfer
+        merchantReference: order-2024-000047
+        amount: 50000
+        currency: TRY
+        metadata:
+          note: payment_mismatch
+        customer:
+          name: Mehmet Kaya
+          email: mehmet.kaya@example.com
+          reference: user-3721
+        occurredAt: 2024-05-03T11:15:42Z
+    WebhookWithdrawalSucceeded:
+      summary: Withdrawal completed successfully
+      value:
+        event: withdrawal.succeeded
+        paymentId: pay_01H9YE4O6PE7A0V2LHUB0B8ZJN
+        type: withdrawal
+        status: succeeded
+        payoutMethod: havale
+        merchantReference: withdrawal-2024-0088
+        amount: 75000
+        currency: TRY
+        metadata:
+          purpose: customer_refund
+          invoice: inv-2040
+        occurredAt: 2024-05-03T12:45:28Z
+    WebhookWithdrawalFailed:
+      summary: Withdrawal processing failed
+      value:
+        event: withdrawal.failed
+        paymentId: pay_01H9YE5P7QF8B1W3MIVC1C9ZKO
+        type: withdrawal
+        status: failed
+        payoutMethod: havale
+        merchantReference: withdrawal-2024-0089
+        amount: 100000
+        currency: TRY
+        metadata:
+          reason: invalid_iban
+        occurredAt: 2024-05-03T13:22:55Z
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: Merchant API key issued by PayinExtra. Retrieve or rotate the key in the merchant panel.
+    MerchantIdAuth:
+      type: apiKey
+      in: header
+      name: X-Merchant-Id
+      description: Unique merchant identifier assigned by PayinExtra and visible in the merchant panel.
